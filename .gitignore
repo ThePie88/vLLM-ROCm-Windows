@@ -1,6 +1,9 @@
 # Upstream vLLM source is cloned separately (see README) and patched in place.
 /vllm/
 
+# Internal design notes, not published
+/research/
+
 # Logs and build artifacts
 *.log
 __pycache__/

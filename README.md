@@ -100,7 +100,6 @@ set HF_HUB_OFFLINE=1
 - `tools/` - patch and fixup scripts
 - `run/` - bench / first-token / profiling drivers
 - `experiments/` - standalone HIP/Triton kernel proofs (build harness, rocWMMA, etc.)
-- `research/` - design notes (Italian)
 
 ## License
 
