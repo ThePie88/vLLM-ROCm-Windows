@@ -24,6 +24,7 @@ try:
         model=MODEL, dtype="float16", attention_backend="TRITON_ATTN",
         tensor_parallel_size=1, gpu_memory_utilization=0.92, max_model_len=4096,
         trust_remote_code=True, enforce_eager=False,
+        kv_cache_dtype=os.environ.get("VLLM_COMPILE_KVDTYPE", "auto"),
         compilation_config={"mode": MODE, "cudagraph_mode": CGMODE},
     )
     p = "The capital of France is Paris. Explain in two sentences why it became the capital."

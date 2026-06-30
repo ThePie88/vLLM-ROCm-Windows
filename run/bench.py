@@ -33,6 +33,9 @@ MAXLEN = int(os.environ.get("VLLM_BENCH_MAXLEN", "2048"))
 GPUUTIL = float(os.environ.get("VLLM_BENCH_GPUUTIL", "0.6"))
 BACKEND = os.environ.get("VLLM_BENCH_BACKEND", "TRITON_ATTN")
 QUANT = os.environ.get("VLLM_BENCH_QUANT") or None
+# VRAM lever: quantize the KV cache (fp8_e4m3 halves KV bytes vs fp16). The TRITON_ATTN
+# backend does the fp8 pack/unpack in Triton, so no native kernel is required on RDNA3.
+KVDTYPE = os.environ.get("VLLM_BENCH_KVDTYPE") or "auto"
 GIB = 2 ** 30
 
 torch.cuda.reset_peak_memory_stats()
@@ -44,8 +47,10 @@ CGMODE = os.environ.get("VLLM_BENCH_CGMODE", "NONE")
 llm_kwargs = dict(
     model=MODEL, dtype="float16", attention_backend=BACKEND, quantization=QUANT,
     tensor_parallel_size=1, gpu_memory_utilization=GPUUTIL, max_model_len=MAXLEN,
+    kv_cache_dtype=KVDTYPE,
     trust_remote_code=(os.environ.get("VLLM_BENCH_TRUST", "1") == "1"),
 )
+print(f"== kv_cache_dtype={KVDTYPE}")
 if _COMPILE:
     # dynamo + inductor fusion of the decode graph (collapses the _to_copy/reshape/slice/
     # as_strided/view micro-op flood). Optionally combine with cudagraph via VLLM_BENCH_CGMODE.
