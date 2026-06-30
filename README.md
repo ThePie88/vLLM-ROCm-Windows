@@ -31,7 +31,7 @@ each model. All weights are 4-bit; KV cache fp16 unless noted.
 | --- | --- | --- | --- |
 | `sahilchachra/Qwythos-9B-Claude-Mythos-5-1M-AWQ` (Qwen3.5 hybrid, 9B) | compressed-tensors W4A16 | 11.4 → 22.3 → **39.9** | eager → +inductor/hipGraph → +native exllama GEMM (8k ctx) |
 | `Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4` (dense, 7B) | GPTQ Int4 | **78** | native exllama GEMM + inductor/hipGraph (8k ctx) |
-| `casperhansen/deepseek-r1-distill-qwen-14b-awq` (dense, 14B) | AWQ Int4 | 12.2 → **37.7** | stock `conch` fallback → custom M=1 W4 GEMV (4k ctx) |
+| `casperhansen/deepseek-r1-distill-qwen-14b-awq` (dense, 14B) | AWQ Int4 | 12.2 → **50.9** | stock `conch` fallback → custom M=1 W4 GEMV, autotuned (4k ctx) |
 
 The Qwythos-9B hybrid (24 linear-attention + 8 full-attention layers, plus an unquantized
 vision tower and a 248k vocab) is a worst case; the dense GPTQ/AWQ models are closer to what the
@@ -104,8 +104,8 @@ ahead of `conch` for AWQ-uint4 decode. AWQ-uint4 has no fast kernel on ROCm (exl
 accepts uint4b8; Marlin is CUDA-only), so vLLM falls back to `conch`, whose throughput-shaped
 tile is ~20x off memory bandwidth for a single decode row. The GEMV is a true reduction (no
 `tl.dot`/split-K/atomicAdd) that reuses `conch`'s weight normalization and delegates prefill
-(M>1) back to `conch`; on `casperhansen/deepseek-r1-distill-qwen-14b-awq` it takes decode from
-12.2 to 37.7 tok/s.
+(M>1) back to `conch`; it is `@triton.autotune`d per shape (BLOCK_N/num_warps). On
+`casperhansen/deepseek-r1-distill-qwen-14b-awq` it takes decode from 12.2 to 50.9 tok/s.
 
 ## Setup
 

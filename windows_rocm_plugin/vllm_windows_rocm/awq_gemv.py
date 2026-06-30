@@ -21,6 +21,11 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
+@triton.autotune(
+    configs=[triton.Config({"BLOCK_N": bn}, num_warps=nw)
+             for bn in (8, 16, 32) for nw in (1, 2)],
+    key=["K", "N"],
+)
 @triton.jit
 def _gemv_k_kernel(
     a_ptr, qw_ptr, s_ptr, z_ptr, c_ptr,
@@ -59,15 +64,13 @@ def _gemv_k_kernel(
 
 def gemv_k(a, w_q, w_s, w_zp, group_size):
     # a: [1, K] fp16 ; w_q: [K//8, N] int32 ; w_s: [K//G, N] fp16 ; w_zp: [K//G, N] uint8
+    # @triton.autotune picks BLOCK_N/num_warps per (K,N): cache-cold, small-N favors BLOCK_N=8,
+    # large-N (gate_up) BLOCK_N=16. Autotune runs during vLLM's eager warmup, before cudagraph capture.
     K = a.shape[-1]
     N = w_s.shape[1]
     c = torch.empty((1, N), dtype=a.dtype, device=a.device)
-    BLOCK_N = 64
-    grid = (triton.cdiv(N, BLOCK_N),)
-    _gemv_k_kernel[grid](
-        a, w_q, w_s, w_zp, c, K, N,
-        BLOCK_N=BLOCK_N, GROUP=group_size, num_warps=2,
-    )
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]),)
+    _gemv_k_kernel[grid](a, w_q, w_s, w_zp, c, K, N, GROUP=group_size)
     return c
 
 
