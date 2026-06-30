@@ -13,37 +13,40 @@ kernels natively on Windows. Upstream vLLM is cloned and pinned separately (see 
 Experimental, but past "it just runs". What currently works on the test machine:
 
 - vLLM imports and **generates correct tokens** on gfx1100, native Windows, single GPU.
-- **compressed-tensors W4A16** models run, using vLLM's **native exllama GEMM** compiled for
-  Windows (the pure-Triton `conch` kernel also works as a fallback).
+- **W4A16 quantized models run** across formats: compressed-tensors, GPTQ-Int4, and AWQ-Int4.
+- vLLM's **native exllama W4A16 GEMM** (`_C.gptq_gemm`) is **compiled natively** for Windows
+  (GPTQ models otherwise have no kernel on Windows at all).
+- A **custom M=1 W4 dequant-GEMV** (Triton) for AWQ-uint4 decode, which has no fast kernel on
+  ROCm otherwise (exllama rejects uint4, Marlin is CUDA-only, leaving only the slow `conch` tile).
 - **torch.compile / inductor works** (CompilationMode.STOCK_TORCH_COMPILE), and **hipGraph
   decode capture works** (`cudagraph_mode=FULL_DECODE_ONLY`).
-- Several of vLLM's own `csrc` HIP kernels are **compiled natively** and wired in (see below).
+- **fp8 KV cache** works (Triton path), ~2x KV-cache capacity / context length.
 
 ### Performance (measured)
 
-Single-stream decode on the test machine, a 9B Qwen3.5 hybrid (linear + full attention)
-model in compressed-tensors W4A16, batch 1, 8k context, greedy. Output was verified to be
-identical across all three configurations.
+Single-stream decode (batch 1, greedy) on the test machine. Output was verified coherent for
+each model. All weights are 4-bit; KV cache fp16 unless noted.
 
-| Configuration | decode |
-| --- | --- |
-| eager, torch fallbacks | 11.4 tok/s |
-| + torch.compile (inductor) + hipGraph decode capture | 22.3 tok/s |
-| + native W4A16 GEMM (exllama) | **39.9 tok/s** |
+| Model | Quantization | decode (tok/s) | notes |
+| --- | --- | --- | --- |
+| `sahilchachra/Qwythos-9B-Claude-Mythos-5-1M-AWQ` (Qwen3.5 hybrid, 9B) | compressed-tensors W4A16 | 11.4 → 22.3 → **39.9** | eager → +inductor/hipGraph → +native exllama GEMM (8k ctx) |
+| `Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4` (dense, 7B) | GPTQ Int4 | **78** | native exllama GEMM + inductor/hipGraph (8k ctx) |
+| `casperhansen/deepseek-r1-distill-qwen-14b-awq` (dense, 14B) | AWQ Int4 | 12.2 → **37.7** | stock `conch` fallback → custom M=1 W4 GEMV (4k ctx) |
 
-TTFT ~50 ms, ~17.7 GiB VRAM at this setting. Aggregate throughput scales with concurrency on
-the same setup (greedy, 128 decode tokens): 73 tok/s at batch 4, 232 at batch 16, 358 at
-batch 32.
+The Qwythos-9B hybrid (24 linear-attention + 8 full-attention layers, plus an unquantized
+vision tower and a 248k vocab) is a worst case; the dense GPTQ/AWQ models are closer to what the
+hardware allows. Aggregate throughput scales with concurrency (Qwen2.5-7B, greedy): ~73 tok/s
+at batch 4, ~232 at batch 16, ~358 at batch 32.
 
-Decode is still below the card's memory-bandwidth roofline; collapsing remaining per-step
-host overhead, tuning the Triton linear-attention path, and porting the rest of the `csrc`
-kernels are ongoing.
+Decode is still below the card's ~800 GB/s memory-bandwidth roofline; per-shape GEMV tuning,
+fp8-KV scale calibration, and porting the rest of the `csrc` kernels are ongoing.
 
 ### Not done
 
 - **Single GPU only.** RCCL does not exist on Windows, so tensor/pipeline parallel are out of
   scope; `torch.distributed` is shimmed for the single-process case only.
-- Large-context VRAM: KV-cache quantization (INT8 / 2-bit) is not wired up yet.
+- KV-cache quantization: fp8 works; sub-8-bit (INT8 / 2-bit / KVarN) is not wired up yet, and
+  fp8 currently uses default scales (calibrated `k_scale`/`v_scale` needed for near-lossless).
 - Only part of vLLM's kernel suite is built natively so far (see "Native kernels" below).
 
 ## Tested stack (pinned, fragile)
@@ -95,6 +98,14 @@ directly, with a small set of redirect shim headers. Currently built and validat
 To select the native exllama GEMM for a compressed-tensors W4A16 model, set
 `VLLM_DISABLED_KERNELS=ConchLinearKernel` (vLLM's ROCm kernel selection then falls through
 from `conch` to the exllama kernel).
+
+The plugin also ships a **custom M=1 W4 dequant-GEMV** (`awq_gemv.py`, pure Triton) registered
+ahead of `conch` for AWQ-uint4 decode. AWQ-uint4 has no fast kernel on ROCm (exllama only
+accepts uint4b8; Marlin is CUDA-only), so vLLM falls back to `conch`, whose throughput-shaped
+tile is ~20x off memory bandwidth for a single decode row. The GEMV is a true reduction (no
+`tl.dot`/split-K/atomicAdd) that reuses `conch`'s weight normalization and delegates prefill
+(M>1) back to `conch`; on `casperhansen/deepseek-r1-distill-qwen-14b-awq` it takes decode from
+12.2 to 37.7 tok/s.
 
 ## Setup
 

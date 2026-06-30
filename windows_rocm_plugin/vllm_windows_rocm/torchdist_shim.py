@@ -496,6 +496,9 @@ def apply() -> None:
         cops.install()  # register torch.ops._C.* fused-op fallbacks
     except Exception as e:
         print("vllm-win cops install warning:", repr(e))
+    # NOTE: the AWQ-GEMV MPLinearKernel is registered later, from
+    # WindowsRocmPlatform.check_and_update_config (importing vllm.platforms here, mid-bootstrap,
+    # would re-enter the platform-plugin loader and circular-import this package).
 
     setattr(dist, _SENTINEL, True)
 

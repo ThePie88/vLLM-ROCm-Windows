@@ -28,3 +28,15 @@ class WindowsRocmPlatform(RocmPlatform):
     def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
         # Single-GPU only on Windows (no amdsmi topology, no RCCL). Never "fully connected".
         return False
+
+    @classmethod
+    def check_and_update_config(cls, vllm_config) -> None:
+        super().check_and_update_config(vllm_config)
+        # Register the fast M=1 AWQ-uint4 GEMV ahead of conch. Done here (engine config setup)
+        # rather than at import/bootstrap: vllm + the platform plugin are fully loaded by now,
+        # so importing vllm.model_executor.kernels.linear won't circular-import this package.
+        try:
+            from . import awq_gemv
+            awq_gemv.register()
+        except Exception as e:  # noqa: BLE001
+            print("vllm-win awq_gemv register warning:", repr(e))
