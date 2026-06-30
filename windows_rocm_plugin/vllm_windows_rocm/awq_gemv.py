@@ -16,9 +16,42 @@ kernel consumes conch's exact post-process layout:
 Dequant (conch SYMMETRIC_WITH_SHIFT, weight_bias=0 for uint4): w[k,n] = (q(k,n) - z(g,n))*s(g,n).
 Validated by token-agreement vs conch on the real model (run/precision_check.py).
 """
+import os
+import sys
+
 import torch
 
 from vllm.triton_utils import tl, triton
+
+# Optional hand-written HIP GEMV (buffer_load dwordx4 + U=8 unroll + split-K) -- beats the Triton
+# kernel on every shape cache-cold (o 24->36%, qkv 33->52%, down 35->61%, gate 67->71% of DRAM).
+# Loaded if built (experiments/w4_gemv/hip/build_run_hip.bat); set VLLM_WIN_HIPGEMV=0 to force Triton.
+_HIP_OK = False        # set True once the HIP .pyd is imported (registers torch.ops.vllm_win_hip)
+_HIP_TRIED = False
+
+
+def _load_hip_gemv():
+    """Import the HIP GEMV .pyd EAGERLY (at registration), so its TORCH_LIBRARY op is available
+    and no import runs inside the dynamo-traced forward. Sets _HIP_OK."""
+    global _HIP_OK, _HIP_TRIED
+    if _HIP_TRIED:
+        return
+    _HIP_TRIED = True
+    # Opt-in (default OFF): the HIP GEMV is faster in the cold microbench but currently LOSES
+    # end-to-end (44 vs Triton-autotune 50.9) -- its split-K atomic+zeros+cast per call costs more
+    # than its bandwidth edge. Needs an atomic-free direct-write path to win e2e. Triton is default.
+    if os.environ.get("VLLM_WIN_HIPGEMV", "0") != "1":
+        return
+    d = os.environ.get("VLLM_WIN_HIPGEMV_DIR", r"C:\vw_hipgemv_build\gemv_w4_hip")
+    try:
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        import gemv_w4_hip  # noqa: F401  -- import triggers the TORCH_LIBRARY(vllm_win_hip) static init
+        _ = torch.ops.vllm_win_hip.gemv_w4  # ensure the op resolved
+        _HIP_OK = True
+        print("vllm-win: loaded native HIP W4 GEMV (torch.ops.vllm_win_hip.gemv_w4) from", d)
+    except Exception as e:  # noqa: BLE001
+        print("vllm-win HIP GEMV not available, using Triton:", repr(e))
 
 
 @triton.autotune(
@@ -68,7 +101,7 @@ def gemv_k(a, w_q, w_s, w_zp, group_size):
     # large-N (gate_up) BLOCK_N=16. Autotune runs during vLLM's eager warmup, before cudagraph capture.
     K = a.shape[-1]
     N = w_s.shape[1]
-    c = torch.empty((1, N), dtype=a.dtype, device=a.device)
+    c = torch.empty((a.shape[0], N), dtype=a.dtype, device=a.device)
     grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]),)
     _gemv_k_kernel[grid](a, w_q, w_s, w_zp, c, K, N, GROUP=group_size)
     return c
@@ -115,7 +148,15 @@ def _register_kernel_class():
             if x2d.shape[0] == 1:
                 w_q, w_s, w_zp, _ = self._get_weight_params(layer)
                 N = w_s.shape[1]
-                out = gemv_k(x2d.contiguous(), w_q, w_s, w_zp, self.config.group_size)
+                if _HIP_OK:
+                    # TORCH_LIBRARY op (registered when the .pyd is imported at registration):
+                    # dynamo-traceable + cudagraph-safe, like the _C ops. split_groups=8 (best cold).
+                    out = torch.ops.vllm_win_hip.gemv_w4(
+                        x2d.contiguous(), w_q, w_s, w_zp, self.config.group_size, 8)
+                else:
+                    # NOTE: the torch custom-op wrapper was tested to remove inductor graph breaks
+                    # but regressed (opaque op disrupts FULL_DECODE_ONLY cudagraph/autotune).
+                    out = gemv_k(x2d.contiguous(), w_q, w_s, w_zp, self.config.group_size)
                 if bias is not None:
                     out = out + bias
                 return out.reshape(x.shape[:-1] + (N,))
@@ -132,6 +173,7 @@ def register() -> None:
     global _REGISTERED
     if _REGISTERED:
         return
+    _load_hip_gemv()  # eager import of the HIP .pyd (registers torch.ops.vllm_win_hip), before any compile
     try:
         from vllm.model_executor.kernels.linear import _POSSIBLE_KERNELS
         from vllm.platforms import PlatformEnum
