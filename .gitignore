@@ -1,0 +1,22 @@
+# Upstream vLLM source is cloned separately (see README) and patched in place.
+/vllm/
+
+# Logs and build artifacts
+*.log
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+*.obj
+*.exp
+*.lib
+*.o
+*.ninja
+.ninja_log
+.ninja_deps
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
