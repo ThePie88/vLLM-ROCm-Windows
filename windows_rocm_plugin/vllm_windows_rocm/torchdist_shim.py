@@ -455,6 +455,38 @@ def apply() -> None:
     except Exception:
         pass
 
+    # ---- torch.distributed.tensor (DTensor) stub: make it look ABSENT like native ----
+    # On this USE_DISTRIBUTED=0 build, `torch.distributed.tensor` is natively unimportable
+    # (ModuleNotFoundError), and torch's own code guards it accordingly -- notably torch.fx
+    # graph printing does `try: from torch.distributed.tensor._api import DTensor, DTensorSpec
+    # except ModuleNotFoundError`, which inductor hits when logging the compiled graph
+    # (_log_inference_graph, verbose=True). But our funcol/distributed_c10d stubs let the REAL
+    # torch.distributed.tensor.__init__ start importing and then fail with ImportError (e.g.
+    # `cannot import name 'AsyncCollectiveTensor'`) -- which is NOT caught -> inductor compile
+    # dies. Fix: pre-register a NON-PACKAGE stub for `torch.distributed.tensor` so the real
+    # __init__ never runs and `torch.distributed.tensor._api` raises ModuleNotFoundError (caught
+    # by torch). We still expose the few top-level names so any direct `from ...tensor import X`
+    # works; single-GPU has no real DTensors, so the dummy classes only feed isinstance()->False.
+    if "torch.distributed.tensor" not in sys.modules:
+        tmod = types.ModuleType("torch.distributed.tensor")
+        tmod.DTensor = type("DTensor", (), {})
+        tmod.DTensorSpec = type("DTensorSpec", (), {})
+        tmod.Shard = type("Shard", (), {})
+        tmod.Replicate = type("Replicate", (), {})
+        tmod.Partial = type("Partial", (), {})
+        tmod.Placement = type("Placement", (), {})
+        tmod.distribute_tensor = lambda t, *a, **k: t
+        tmod.distribute_module = lambda m, *a, **k: m
+        if hasattr(dist, "DeviceMesh"):
+            tmod.DeviceMesh = dist.DeviceMesh
+        if hasattr(dist, "init_device_mesh"):
+            tmod.init_device_mesh = dist.init_device_mesh
+        # Intentionally NO __path__: importing `torch.distributed.tensor._api` (or any submodule)
+        # raises ModuleNotFoundError ("not a package"), exactly the native-absent behavior that
+        # torch.fx's `except ModuleNotFoundError` relies on.
+        sys.modules["torch.distributed.tensor"] = tmod
+        dist.tensor = tmod
+
     _install_amdsmi_stub(torch)
     _install_uvloop_stub()
     _install_fcntl_stub()

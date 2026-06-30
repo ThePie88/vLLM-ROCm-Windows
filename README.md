@@ -5,29 +5,46 @@ Windows** (no WSL2) with **AMD ROCm** on **RDNA3** consumer GPUs. Developed and 
 **Radeon RX 7900 XT (gfx1100)**.
 
 This is **not** a fork of vLLM. It is an out-of-tree platform plugin plus a set of
-compatibility shims, a one-line patch, and a build harness. Upstream vLLM is cloned and
-pinned separately (see Setup).
+compatibility shims, a one-line patch, and a build harness that compiles vLLM's own HIP
+kernels natively on Windows. Upstream vLLM is cloned and pinned separately (see Setup).
 
 ## Status (honest)
 
-Experimental / early. What currently works on the test machine:
+Experimental, but past "it just runs". What currently works on the test machine:
 
 - vLLM imports and **generates correct tokens** on gfx1100, native Windows, single GPU.
-- Weight-quantized models run: **compressed-tensors / AWQ W4A16** via the pure-Triton
-  `conch` kernel (no CUDA-only Marlin needed).
-- A real 9B Qwen3.5 hybrid (linear + full attention) MoE model loads and runs.
-- **hipGraph capture works** (`cudagraph_mode=FULL_DECODE_ONLY`, no inductor).
+- **compressed-tensors W4A16** models run, using vLLM's **native exllama GEMM** compiled for
+  Windows (the pure-Triton `conch` kernel also works as a fallback).
+- **torch.compile / inductor works** (CompilationMode.STOCK_TORCH_COMPILE), and **hipGraph
+  decode capture works** (`cudagraph_mode=FULL_DECODE_ONLY`).
+- Several of vLLM's own `csrc` HIP kernels are **compiled natively** and wired in (see below).
 
-What is **not** done:
+### Performance (measured)
 
-- **Performance is not yet competitive.** Single-stream decode on the 9B hybrid is around
-  ~12 tok/s, versus ~30 tok/s for a comparable GGUF on llama.cpp/Vulkan on the same card.
-  The decode is kernel-bound (unfused norms/activations as torch fallbacks, the Triton GDN
-  linear-attention path, MoE). Porting vLLM's native HIP kernels (`csrc/`) to Windows and
-  fusing the hot paths is in progress.
-- **Single GPU only.** RCCL does not exist on Windows, so tensor/pipeline parallel are out
-  of scope; `torch.distributed` is shimmed for the single-process case only.
+Single-stream decode on the test machine, a 9B Qwen3.5 hybrid (linear + full attention)
+model in compressed-tensors W4A16, batch 1, 8k context, greedy. Output was verified to be
+identical across all three configurations.
+
+| Configuration | decode |
+| --- | --- |
+| eager, torch fallbacks | 11.4 tok/s |
+| + torch.compile (inductor) + hipGraph decode capture | 22.3 tok/s |
+| + native W4A16 GEMM (exllama) | **39.9 tok/s** |
+
+TTFT ~50 ms, ~17.7 GiB VRAM at this setting. Aggregate throughput scales with concurrency on
+the same setup (greedy, 128 decode tokens): 73 tok/s at batch 4, 232 at batch 16, 358 at
+batch 32.
+
+Decode is still below the card's memory-bandwidth roofline; collapsing remaining per-step
+host overhead, tuning the Triton linear-attention path, and porting the rest of the `csrc`
+kernels are ongoing.
+
+### Not done
+
+- **Single GPU only.** RCCL does not exist on Windows, so tensor/pipeline parallel are out of
+  scope; `torch.distributed` is shimmed for the single-process case only.
 - Large-context VRAM: KV-cache quantization (INT8 / 2-bit) is not wired up yet.
+- Only part of vLLM's kernel suite is built natively so far (see "Native kernels" below).
 
 ## Tested stack (pinned, fragile)
 
@@ -50,12 +67,34 @@ Note: helper scripts contain absolute paths from the author's machine
   - A **single-process `torch.distributed` shim** (the Windows ROCm torch wheel is built
     without distributed), plus stubs for `amdsmi`, `uvloop`, `fcntl`,
     `torch._C._distributed_c10d`, and a tokenizer-class compatibility alias.
-  - `cops.py`: torch-native fallbacks for the `torch.ops._C.*` fused ops that vLLM binds
-    unconditionally (`silu_and_mul`, `rms_norm`, `fused_add_rms_norm`, `rotary_embedding`,
-    `weak_ref_tensor`). These are correctness-first; replacing them with native HIP kernels
-    is the current work.
-- vLLM is installed with `VLLM_TARGET_DEVICE=empty` (no kernels compiled) plus a one-line
-  patch to `vllm/__init__.py` that imports the shim early.
+  - A **`torch.distributed.tensor` stub** that makes the (natively absent) DTensor module
+    raise `ModuleNotFoundError` instead of a half-initialized `ImportError`. inductor's graph
+    logging guards that import with `except ModuleNotFoundError`; without the stub,
+    `torch.compile` dies during compilation. This is what unblocks inductor here.
+  - `cops.py`: loads the compiled native kernel library (see below) so `torch.ops._C.*`
+    resolve to the real HIP kernels, and registers torch-native fallbacks for any op the
+    native build does not provide (so vLLM's unconditional `torch.ops._C.*` bindings work
+    either way).
+- vLLM is installed with `VLLM_TARGET_DEVICE=empty` (no kernels compiled by vLLM's own build)
+  plus a one-line patch to `vllm/__init__.py` that imports the shim early.
+
+### Native kernels
+
+`experiments/vllm_c_ext/` builds vLLM's **own** `csrc` HIP kernels for Windows. vLLM's
+Linux build relies on a CUDA->HIP header redirect that the Windows torch wheel does not ship,
+and `cpp_extension`'s hipify orchestrator mishandles Windows paths, so the harness applies
+torch's hipify substitution engine (`RE_PYTORCH_PREPROCESSOR` + `PYTORCH_MAP`) to the sources
+directly, with a small set of redirect shim headers. Currently built and validated:
+
+- `silu_and_mul`, `rms_norm`, `fused_add_rms_norm`, `rotary_embedding` (fused activation /
+  layernorm / RoPE)
+- the **W4A16 GPTQ/exllama GEMM** (`gptq_gemm`, `gptq_shuffle`) from
+  `csrc/quantization/gptq/q_gemm.cu`, which has a dedicated small-batch path for single-stream
+  decode
+
+To select the native exllama GEMM for a compressed-tensors W4A16 model, set
+`VLLM_DISABLED_KERNELS=ConchLinearKernel` (vLLM's ROCm kernel selection then falls through
+from `conch` to the exllama kernel).
 
 ## Setup
 
@@ -74,6 +113,10 @@ cd ..
 python tools\patch_vllm.py vllm
 python -m pip install -e windows_rocm_plugin
 python -m pip install conch-triton-kernels llguidance xgrammar
+
+:: 4. (optional) Build vLLM's native HIP kernels for Windows
+cd experiments\vllm_c_ext
+build_run.bat
 ```
 
 ## Running
@@ -84,8 +127,13 @@ installed `vllm` package).
 ```bat
 cd run
 python first_token.py        :: smallest end-to-end smoke test (OPT-125m)
-python bench.py              :: throughput + VRAM (configure via VLLM_BENCH_* env vars)
+python bench.py              :: decode tok/s + VRAM (configure via VLLM_BENCH_* env vars)
+python batch_sweep.py        :: aggregate throughput vs concurrency
 ```
+
+`bench.py` knobs (env): `VLLM_BENCH_COMPILE=1` enables inductor, `VLLM_BENCH_CGMODE=FULL_DECODE_ONLY`
+enables hipGraph decode capture, `VLLM_DISABLED_KERNELS=ConchLinearKernel` selects the native
+exllama GEMM.
 
 For a quantized model with a broken tokenizer_class (e.g. some llm-compressor exports):
 
@@ -98,8 +146,8 @@ set HF_HUB_OFFLINE=1
 
 - `windows_rocm_plugin/` - the out-of-tree platform plugin and compatibility shims
 - `tools/` - patch and fixup scripts
-- `run/` - bench / first-token / profiling drivers
-- `experiments/` - standalone HIP/Triton kernel proofs (build harness, rocWMMA, etc.)
+- `run/` - bench / first-token / profiling / batch-sweep drivers
+- `experiments/` - native `csrc` kernel build harness and standalone HIP/Triton kernel proofs
 
 ## License
 

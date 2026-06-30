@@ -9,10 +9,48 @@ implementations, so the model runs end-to-end.
 
 These are CORRECTNESS-first (torch ops). Phase 2 replaces the hot ones with fused Triton/HIP
 kernels for speed — same op names, so no vLLM changes needed.
+
+Native-kernel handoff: if the compiled `vllm_win_C` library (built from vLLM's own csrc via
+experiments/vllm_c_ext/) is present, we load it FIRST. Its TORCH_LIBRARY(_C) registrations
+(silu_and_mul/rms_norm/fused_add_rms_norm/rotary_embedding, real HIP kernels) then take over,
+and the fallbacks below are installed only for ops the native lib does NOT provide (e.g.
+weak_ref_tensor). Set VLLM_WIN_C_DIR to override the build dir; set VLLM_WIN_C_NATIVE=0 to
+force pure fallbacks (for A/B measurement).
 """
+import glob
+import os
+import sys
+
 import torch
 
 _INSTALLED = False
+_NATIVE_DIR = os.environ.get("VLLM_WIN_C_DIR", r"C:\vw_cext_build")
+
+
+def _load_native() -> str | None:
+    """Load the compiled vLLM _C kernels (vllm_win_C.pyd) so its TORCH_LIBRARY(_C) wins."""
+    if os.environ.get("VLLM_WIN_C_NATIVE", "1") == "0":
+        return None
+    cands = sorted(glob.glob(os.path.join(_NATIVE_DIR, "vllm_win_C*.pyd")))
+    for p in cands:
+        # torch.ops.load_library binds the TORCH_LIBRARY static initializers without needing
+        # a Python import; dependent DLLs (c10/torch_hip/amdhip64) are already in-process.
+        try:
+            torch.ops.load_library(p)
+            return p
+        except Exception as e:
+            print("vllm-win native _C load_library warning:", repr(e))
+            # fallback: import as a module (adds nothing extra, but uses Python's loader path)
+            try:
+                d = os.path.dirname(p)
+                if d not in sys.path:
+                    sys.path.insert(0, d)
+                import importlib
+                importlib.import_module(os.path.splitext(os.path.basename(p))[0])
+                return p
+            except Exception as e2:
+                print("vllm-win native _C import warning:", repr(e2))
+    return None
 
 
 def _silu_and_mul(result: torch.Tensor, x: torch.Tensor) -> None:
@@ -74,13 +112,15 @@ def install() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
-    # If a real _C with these ops exists (a future native build), don't shadow it.
-    if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "silu_and_mul"):
-        _INSTALLED = True
-        return
+    # Load the compiled native kernels first; their TORCH_LIBRARY(_C) ops win over fallbacks.
+    native = _load_native()
     lib = torch.library.Library("_C", "FRAGMENT")
     for schema, fn in _OPS:
         name = schema.split("(", 1)[0]
+        # Per-op guard: if the native lib already provides this op, don't shadow it (but DO
+        # still register the others, e.g. weak_ref_tensor, which the native lib lacks).
+        if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, name):
+            continue
         try:
             lib.define(schema)
         except Exception:
@@ -93,3 +133,7 @@ def install() -> None:
     # keep a ref so the Library isn't GC'd
     globals()["_LIB"] = lib
     _INSTALLED = True
+    if native:
+        present = [s.split("(", 1)[0] for s, _ in _OPS
+                   if hasattr(torch.ops._C, s.split("(", 1)[0])]
+        print("vllm-win: native _C kernels loaded from", native, "| ops:", present)

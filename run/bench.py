@@ -15,9 +15,13 @@ import time
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 os.environ.setdefault("VLLM_ROCM_USE_SKINNY_GEMM", "0")
 os.environ.setdefault("VLLM_ROCM_USE_AITER", "0")
-# torch.distributed.tensor is broken on this USE_DISTRIBUTED=0 build; conch/other kernels
-# may trigger torch.compile/inductor which imports it. enforce_eager doesn't need compile.
-os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+# VLLM_BENCH_COMPILE: 0 = eager/graph (default), or a CompilationMode (1=STOCK_TORCH_COMPILE,
+# 2=DYNAMO_TRACE_ONCE, 3=VLLM_COMPILE) to enable dynamo+inductor fusion of the decode graph.
+_COMPILE = int(os.environ.get("VLLM_BENCH_COMPILE", "0"))
+if not _COMPILE:
+    # Without compile, dynamo must stay off: torch.compile/inductor paths import broken bits on
+    # this USE_DISTRIBUTED=0 build. enforce_eager doesn't need compile.
+    os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
 import torch  # noqa: E402
 from vllm import LLM, SamplingParams  # noqa: E402
@@ -36,14 +40,21 @@ free0, total = torch.cuda.mem_get_info()
 print(f"== {MODEL} | backend={BACKEND} quant={QUANT} | GPU {total/GIB:.1f} GiB, free {free0/GIB:.1f} GiB")
 
 GRAPH = os.environ.get("VLLM_BENCH_GRAPH", "0") == "1"
+CGMODE = os.environ.get("VLLM_BENCH_CGMODE", "NONE")
 llm_kwargs = dict(
     model=MODEL, dtype="float16", attention_backend=BACKEND, quantization=QUANT,
     tensor_parallel_size=1, gpu_memory_utilization=GPUUTIL, max_model_len=MAXLEN,
     trust_remote_code=(os.environ.get("VLLM_BENCH_TRUST", "1") == "1"),
 )
-if GRAPH:
+if _COMPILE:
+    # dynamo + inductor fusion of the decode graph (collapses the _to_copy/reshape/slice/
+    # as_strided/view micro-op flood). Optionally combine with cudagraph via VLLM_BENCH_CGMODE.
+    llm_kwargs["enforce_eager"] = False
+    llm_kwargs["compilation_config"] = {"mode": _COMPILE, "cudagraph_mode": CGMODE}
+    print(f"== compile: mode={_COMPILE} cudagraph={CGMODE} (inductor)")
+elif GRAPH:
     # FULL_DECODE_ONLY captures a full HIP graph for decode with NO inductor (mode=NONE),
-    # collapsing the eager per-op dispatch overhead. PIECEWISE would need inductor (broken).
+    # collapsing the eager per-op dispatch overhead.
     llm_kwargs["enforce_eager"] = False
     llm_kwargs["compilation_config"] = {"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}
     print("== cudagraph: FULL_DECODE_ONLY (mode=NONE, no inductor)")

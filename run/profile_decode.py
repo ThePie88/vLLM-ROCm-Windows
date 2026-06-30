@@ -8,17 +8,27 @@ import time
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 os.environ.setdefault("VLLM_ROCM_USE_SKINNY_GEMM", "0")
 os.environ.setdefault("VLLM_ROCM_USE_AITER", "0")
-os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+# VLLM_PROFILE_COMPILE: 0 = eager (default), or CompilationMode 1/2/3 for inductor.
+_COMPILE = int(os.environ.get("VLLM_PROFILE_COMPILE", "0"))
+if not _COMPILE:
+    os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
 import torch  # noqa: E402
 from torch.profiler import profile, ProfilerActivity  # noqa: E402
 from vllm import LLM, SamplingParams  # noqa: E402
 
 MODEL = os.environ.get("VLLM_BENCH_MODEL", "sahilchachra/Qwythos-9B-Claude-Mythos-5-1M-AWQ")
-llm = LLM(model=MODEL, enforce_eager=True, dtype="float16", attention_backend="TRITON_ATTN",
-          tensor_parallel_size=1, gpu_memory_utilization=0.92, max_model_len=4096,
-          trust_remote_code=True)
+_kw = dict(model=MODEL, dtype="float16", attention_backend="TRITON_ATTN",
+           tensor_parallel_size=1, gpu_memory_utilization=0.92, max_model_len=4096,
+           trust_remote_code=True)
+if _COMPILE:
+    # inductor fusion, NO cudagraph (so the profiler sees the fused kernels individually).
+    _kw["enforce_eager"] = False
+    _kw["compilation_config"] = {"mode": _COMPILE, "cudagraph_mode": "NONE"}
+else:
+    _kw["enforce_eager"] = True
+llm = LLM(**_kw)
 
 prompts = ["Explain in detail how a modern GPU executes a matrix multiplication."]
 llm.generate(prompts, SamplingParams(temperature=0, max_tokens=8))  # warmup
