@@ -95,6 +95,52 @@ def _gemv_k_kernel(
     tl.store(c_ptr + n, acc.to(c_ptr.type.element_ty), mask=nmask)
 
 
+@triton.autotune(
+    configs=[triton.Config({"BLOCK_N": bn}, num_warps=nw)
+             for bn in (8, 16, 32) for nw in (1, 2)],
+    key=["K", "N"],
+)
+@triton.jit
+def _gemv_k_sym_kernel(
+    a_ptr, qw_ptr, s_ptr, c_ptr,
+    K, N,
+    BLOCK_N: tl.constexpr,
+    GROUP: tl.constexpr,
+    BIAS: tl.constexpr,   # symmetric zero-point (8 for uint4b8); dequant = (q - BIAS) * s
+):
+    pid = tl.program_id(0)
+    n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    nmask = n < N
+    ROWS: tl.constexpr = GROUP // 8
+    shifts = (tl.arange(0, 8) * 4).to(tl.int32)
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    num_groups = K // GROUP
+    for g in range(0, num_groups):
+        k0 = g * GROUP
+        row = (k0 // 8) + tl.arange(0, ROWS)
+        qw = tl.load(qw_ptr + row[:, None] * N + n[None, :],
+                     mask=nmask[None, :], other=0)
+        q = (qw[:, None, :] >> shifts[None, :, None]) & 0xF
+        q = tl.reshape(q, (GROUP, BLOCK_N)).to(tl.float32)
+        a = tl.load(a_ptr + k0 + tl.arange(0, GROUP)).to(tl.float32)
+        contrib = tl.sum(a[:, None] * q, axis=0)
+        asum = tl.sum(a)
+        s = tl.load(s_ptr + g * N + n, mask=nmask, other=0.0).to(tl.float32)
+        # sum_k a*(q - BIAS)*s = s * (sum_k a*q - BIAS*sum_k a)
+        acc += (contrib - BIAS * asum) * s
+    tl.store(c_ptr + n, acc.to(c_ptr.type.element_ty), mask=nmask)
+
+
+def gemv_k_sym(a, w_q, w_s, group_size, bias):
+    # a: [1, K] ; w_q: [K//8, N] int32 packed-K ; w_s: [K//G, N] ; symmetric (no zero points)
+    K = a.shape[-1]
+    N = w_s.shape[1]
+    c = torch.empty((a.shape[0], N), dtype=a.dtype, device=a.device)
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]),)
+    _gemv_k_sym_kernel[grid](a, w_q, w_s, c, K, N, GROUP=group_size, BIAS=bias)
+    return c
+
+
 def gemv_k(a, w_q, w_s, w_zp, group_size):
     # a: [1, K] fp16 ; w_q: [K//8, N] int32 ; w_s: [K//G, N] fp16 ; w_zp: [K//G, N] uint8
     # @triton.autotune picks BLOCK_N/num_warps per (K,N): cache-cold, small-N favors BLOCK_N=8,
@@ -166,6 +212,82 @@ def _register_kernel_class():
     return WinRocmAwqGemvKernel
 
 
+def _register_dequant_kernel_class():
+    """Correctness fallback MPLinearKernel: dequantize W4A16 to the activation dtype and do a
+    plain matmul. Handles ANY group_size -- notably group_size 32, which conch computes
+    incorrectly on ROCm (its Triton kernel applies one scale per block_k=64 tile) and which
+    exllama (fp16-only) also can't take in bf16. Registered LAST in the ROCm priority so the
+    faster kernels win whenever they legitimately apply; this only catches what they reject."""
+    from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
+        MPLinearKernel,
+    )
+    from vllm.scalar_type import scalar_types
+
+    class WinRocmW4A16DequantKernel(MPLinearKernel):
+        @classmethod
+        def get_min_capability(cls) -> int:
+            return 0
+
+        @classmethod
+        def can_implement(cls, c):
+            if c.weight_type not in (scalar_types.uint4, scalar_types.uint4b8):
+                return False, "WinRocmW4A16Dequant supports only uint4 / uint4b8"
+            if c.has_g_idx:
+                return False, "WinRocmW4A16Dequant does not support act-order g_idx"
+            return True, None
+
+        def process_weights_after_loading(self, layer) -> None:
+            # Reuse conch's normalization (layout permute + zero-point unpack); it does not
+            # depend on group_size, only can_implement does.
+            from vllm.model_executor.kernels.linear.mixed_precision.conch import (
+                ConchLinearKernel,
+            )
+            self._conch = ConchLinearKernel(
+                self.config, self.w_q_name, self.w_s_name, self.w_zp_name, self.w_gidx_name
+            )
+            self._conch.process_weights_after_loading(layer)
+
+        def apply_weights(self, layer, x, bias=None):
+            # conch-normalized layout: w_q [K//8, N] int32 packed-along-K (straight order),
+            # w_s [K//G, N], w_zp [K//G, N] uint8 unpacked (or None for symmetric uint4b8).
+            w_q, w_s, w_zp, _ = self._get_weight_params(layer)
+            K = x.shape[-1]
+            N = w_s.shape[1]
+            G = self.config.group_size
+            if G is None or G < 0:
+                G = K
+            wb = self.config.weight_type.bias or 0  # uint4b8 (symmetric) -> 8
+            x2d = x.reshape(-1, K)
+            M = x2d.shape[0]
+
+            if M == 1:
+                # Decode (latency path): fused streaming dequant-GEMV, no weight materialization.
+                xc = x2d.contiguous()
+                if w_zp is None:
+                    out = gemv_k_sym(xc, w_q, w_s, G, wb)
+                else:
+                    out = gemv_k(xc, w_q, w_s, w_zp, G)
+            else:
+                # Prefill (one-shot): dequant to the activation dtype (bf16/fp16, NOT fp32) and
+                # matmul. Transient [K, N] weight is freed immediately after the GEMM.
+                dev = w_q.device
+                shifts = (torch.arange(8, device=dev, dtype=torch.int32) * 4)
+                codes = ((w_q.unsqueeze(1) >> shifts.view(1, 8, 1)) & 0xF).reshape(K, N)
+                gidx = torch.arange(K, device=dev) // G
+                s = w_s.index_select(0, gidx)
+                if w_zp is not None:
+                    z = w_zp.index_select(0, gidx).to(x.dtype)
+                    w = (codes.to(x.dtype) - z) * s.to(x.dtype)
+                else:
+                    w = (codes.to(x.dtype) - wb) * s.to(x.dtype)
+                out = x2d @ w
+            if bias is not None:
+                out = out + bias
+            return out.reshape(x.shape[:-1] + (N,))
+
+    return WinRocmW4A16DequantKernel
+
+
 _REGISTERED = False
 
 
@@ -175,6 +297,11 @@ def register() -> None:
         return
     _load_hip_gemv()  # eager import of the HIP .pyd (registers torch.ops.vllm_win_hip), before any compile
     try:
+        from . import moe_decode
+        moe_decode.patch_moe()  # opt-in M=1 MoE-decode GEMV (VLLM_WIN_MOE_DECODE=1)
+    except Exception as e:  # noqa: BLE001
+        print("vllm-win moe_decode wire warning:", repr(e))
+    try:
         from vllm.model_executor.kernels.linear import _POSSIBLE_KERNELS
         from vllm.platforms import PlatformEnum
 
@@ -182,7 +309,11 @@ def register() -> None:
         lst = _POSSIBLE_KERNELS.get(PlatformEnum.ROCM, [])
         if kcls not in lst:
             lst.insert(0, kcls)
+        # Correctness fallback for group sizes conch can't do (e.g. 32): append LAST.
+        dq = _register_dequant_kernel_class()
+        if dq not in lst:
+            lst.append(dq)
         _REGISTERED = True
-        print("vllm-win: registered WinRocmAwqGemvKernel (M=1 W4 GEMV) ahead of conch")
+        print("vllm-win: registered WinRocmAwqGemvKernel (front) + W4A16 dequant fallback (last)")
     except Exception as e:  # noqa: BLE001
         print("vllm-win awq_gemv register warning:", repr(e))
