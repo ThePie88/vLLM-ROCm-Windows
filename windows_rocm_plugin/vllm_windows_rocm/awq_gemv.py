@@ -307,6 +307,21 @@ def register() -> None:
     except Exception as e:  # noqa: BLE001
         print("vllm-win bf16_gemv wire warning:", repr(e))
     try:
+        # Native _rocm_C skinny GEMMs (LLMM1 + wvSplitK), built 1:1 from csrc/rocm/skinny_gemms.cu.
+        # Loading registers torch.ops._rocm_C.*; with VLLM_ROCM_USE_SKINNY_GEMM=1, vLLM's
+        # rocm_unquantized_gemm routes the M=1 dense (MLP/attn-proj) GEMVs through wvSplitK.
+        if os.environ.get("VLLM_WIN_ROCM_C", "0") == "1":
+            import glob
+            import torch
+            d = os.environ.get("VLLM_WIN_ROCM_C_DIR", r"C:\vw_rocmc_build")
+            for p in sorted(glob.glob(os.path.join(d, "*.pyd"))):
+                torch.ops.load_library(p)
+                if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK"):
+                    print("vllm-win: loaded native _rocm_C skinny GEMM from", p)
+                    break
+    except Exception as e:  # noqa: BLE001
+        print("vllm-win _rocm_C load warning:", repr(e))
+    try:
         from vllm.model_executor.kernels.linear import _POSSIBLE_KERNELS
         from vllm.platforms import PlatformEnum
 
