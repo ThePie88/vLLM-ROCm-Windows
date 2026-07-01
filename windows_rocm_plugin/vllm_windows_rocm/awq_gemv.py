@@ -302,6 +302,11 @@ def register() -> None:
     except Exception as e:  # noqa: BLE001
         print("vllm-win moe_decode wire warning:", repr(e))
     try:
+        from . import bf16_gemv
+        bf16_gemv.patch_unquantized_linear()  # opt-in M=1 dense bf16 GEMV (VLLM_WIN_BF16_GEMV=1)
+    except Exception as e:  # noqa: BLE001
+        print("vllm-win bf16_gemv wire warning:", repr(e))
+    try:
         from vllm.model_executor.kernels.linear import _POSSIBLE_KERNELS
         from vllm.platforms import PlatformEnum
 
