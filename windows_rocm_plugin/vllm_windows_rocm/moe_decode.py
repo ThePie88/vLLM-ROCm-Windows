@@ -24,17 +24,22 @@ _BIAS = 8.0
 
 
 @triton.jit
-def _moe_gemv_batched_kernel(x_ptr, w_ptr, s_ptr, o_ptr, K, N, Kp, Gc, SXE,
+def _moe_gemv_batched_kernel(x_ptr, w_ptr, s_ptr, ids_ptr, o_ptr, K, N, Kp, Gc, SXE, NE,
                              BLOCK_N: tl.constexpr, GROUP: tl.constexpr, BIAS: tl.constexpr):
-    # One launch over (E_active, N tiles): out[e, n] = sum_k x[e,k]*(nib(w[e,n,k])-BIAS)*s[e,n,k//G].
-    # SXE = x expert-stride: 0 -> x shared across experts (gate_up); K -> per-expert x (down).
+    # One launch over (E_active, N tiles): out[e, n] = sum_k x[e,k]*(nib(w[eid,n,k])-BIAS)*s[eid,n,k//G].
+    # GATHER-IN-KERNEL: w/s are the FULL [NE, N, *] expert tensors; eid = ids[e] selects the active
+    # expert by index INSIDE the kernel -> no index_select materialisation (was ~2x weight traffic:
+    # gather-copy then GEMV-read). x is still addressed by the LOCAL active index e (SXE = 0 -> x
+    # shared across experts for gate_up; K -> per-active-expert x for down). Capture-safe: ids is a
+    # GPU tensor arg loaded in-kernel, not a host-side scalar index of a weight tensor.
     e = tl.program_id(0)
     n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     nmask = n < N
+    eid = tl.load(ids_ptr + e).to(tl.int64)
     acc = tl.zeros((BLOCK_N,), tl.float32)
     HALF: tl.constexpr = GROUP // 2
-    wrow = w_ptr + e * N * Kp + n[:, None] * Kp
-    srow = s_ptr + e * N * Gc + n * Gc
+    wrow = w_ptr + eid * N * Kp + n[:, None] * Kp
+    srow = s_ptr + eid * N * Gc + n * Gc
     xrow = x_ptr + e * SXE
     num_groups = K // GROUP
     for g in range(num_groups):
@@ -52,14 +57,16 @@ def _moe_gemv_batched_kernel(x_ptr, w_ptr, s_ptr, o_ptr, K, N, Kp, Gc, SXE,
     tl.store(o_ptr + e * N + n, acc.to(o_ptr.type.element_ty), mask=nmask)
 
 
-def _moe_gemv_batched(x, w, s, group_size, x_per_expert):
-    # w [E, N, K//2] uint8; s [E, N, K//G]; x [K] (shared) or [E, K] (per-expert) -> out [E, N]
-    E, N, Kp = w.shape
+def _moe_gemv_batched(x, w, s, ids, group_size, x_per_expert):
+    # w [NE, N, K//2] uint8 (FULL expert set); s [NE, N, K//G]; ids [E] active expert ids;
+    # x [K] (shared) or [E, K] (per-active-expert) -> out [E, N]
+    NE, N, Kp = w.shape
+    E = ids.shape[0]
     K = x.shape[-1]
     sxe = K if x_per_expert else 0
     o = torch.empty(E, N, dtype=x.dtype, device=x.device)
     grid = lambda m: (E, triton.cdiv(N, m["BLOCK_N"]))
-    _moe_gemv_batched_kernel[grid](x, w, s, o, K, N, Kp, s.shape[2], sxe,
+    _moe_gemv_batched_kernel[grid](x, w, s, ids, o, K, N, Kp, s.shape[2], sxe, NE,
                                    BLOCK_N=64, GROUP=group_size, BIAS=_BIAS)
     return o
 
@@ -68,28 +75,28 @@ def _moe_decode(method, layer, x, topk_weights, topk_ids):
     G = method.group_size
     w13p, w13s = layer.w13_weight_packed, layer.w13_weight_scale
     w2p, w2s = layer.w2_weight_packed, layer.w2_weight_scale
-    apply_on_input = getattr(layer, "apply_router_weight_on_input", False)
     x0 = x[0]                                    # [H] shared across the active experts at decode
-    # Gather the active experts ONCE via index_select (cudagraph-capturable); indexing a weight
-    # tensor with a GPU scalar would throw hipErrorStreamCaptureUnsupported during graph capture.
-    ids = topk_ids[0]
-    w13pe = w13p.index_select(0, ids); w13se = w13s.index_select(0, ids)
-    w2pe = w2p.index_select(0, ids); w2se = w2s.index_select(0, ids)
+    ids = topk_ids[0]                            # [tk] active expert ids (GPU)
     wts = topk_weights[0].to(x.dtype)            # [tk]
     if _HIP_MOE:
-        # Native HIP fused MoE-decode kernel (warp-per-row, dwordx4, ~454 GB/s).
+        # Native HIP kernel still takes gathered weights (index_select here, opt-in path only).
+        w13pe = w13p.index_select(0, ids); w13se = w13s.index_select(0, ids)
+        w2pe = w2p.index_select(0, ids); w2se = w2s.index_select(0, ids)
         y = torch.ops.vllm_win_moe.moe_decode_w4(
             x0.contiguous(), w13pe.contiguous(), w13se.contiguous(),
             w2pe.contiguous(), w2se.contiguous(), wts.contiguous(), int(G), 8)
         return y.unsqueeze(0)
+    # Gather-in-kernel: pass the FULL expert tensors + ids -> the GEMV reads the selected experts
+    # by index, so no index_select copy of the int4 weights (that copy doubled the weight memory
+    # traffic on a memory-bound M=1 MoE; here each weight byte is read exactly once).
     # gate_up for ALL active experts in ONE launch (x shared) -> [tk, 2*I]
-    gate_up = _moe_gemv_batched(x0, w13pe, w13se, G, x_per_expert=False)
+    gate_up = _moe_gemv_batched(x0, w13p, w13s, ids, G, x_per_expert=False)
     half = gate_up.shape[1] // 2
     act = torch.nn.functional.gelu(
         gate_up[:, :half], approximate="tanh") * gate_up[:, half:]  # GeGLU (gemma) [tk, I]
     act = act.contiguous()
-    # down for ALL active experts in ONE launch (x per-expert) -> [tk, H]
-    down = _moe_gemv_batched(act, w2pe, w2se, G, x_per_expert=True)
+    # down for ALL active experts in ONE launch (x per-active-expert) -> [tk, H]
+    down = _moe_gemv_batched(act, w2p, w2s, ids, G, x_per_expert=True)
     y = (wts[:, None] * down).sum(0)             # weighted sum over the top_k experts -> [H]
     return y.unsqueeze(0)
 
