@@ -76,6 +76,12 @@ def _moe_decode(method, layer, x, topk_weights, topk_ids):
     w13pe = w13p.index_select(0, ids); w13se = w13s.index_select(0, ids)
     w2pe = w2p.index_select(0, ids); w2se = w2s.index_select(0, ids)
     wts = topk_weights[0].to(x.dtype)            # [tk]
+    if _HIP_MOE:
+        # Native HIP fused MoE-decode kernel (warp-per-row, dwordx4, ~454 GB/s).
+        y = torch.ops.vllm_win_moe.moe_decode_w4(
+            x0.contiguous(), w13pe.contiguous(), w13se.contiguous(),
+            w2pe.contiguous(), w2se.contiguous(), wts.contiguous(), int(G), 8)
+        return y.unsqueeze(0)
     # gate_up for ALL active experts in ONE launch (x shared) -> [tk, 2*I]
     gate_up = _moe_gemv_batched(x0, w13pe, w13se, G, x_per_expert=False)
     half = gate_up.shape[1] // 2
@@ -86,6 +92,26 @@ def _moe_decode(method, layer, x, topk_weights, topk_ids):
     down = _moe_gemv_batched(act, w2pe, w2se, G, x_per_expert=True)
     y = (wts[:, None] * down).sum(0)             # weighted sum over the top_k experts -> [H]
     return y.unsqueeze(0)
+
+
+_HIP_MOE = False
+
+
+def _load_hip_moe():
+    global _HIP_MOE
+    if os.environ.get("VLLM_WIN_MOE_HIP", "0") != "1":
+        return
+    import glob
+    d = os.environ.get("VLLM_WIN_MOE_HIP_DIR", r"C:\vw_moedev_build")
+    for p in sorted(glob.glob(os.path.join(d, "*.pyd"))):
+        try:
+            torch.ops.load_library(p)
+            if hasattr(torch.ops, "vllm_win_moe") and hasattr(torch.ops.vllm_win_moe, "moe_decode_w4"):
+                _HIP_MOE = True
+                print("vllm-win: loaded native HIP MoE-decode kernel from", p)
+                return
+        except Exception as e:  # noqa: BLE001
+            print("vllm-win HIP MoE load warning:", repr(e))
 
 
 _PATCHED = False
@@ -102,6 +128,7 @@ def patch_moe() -> None:
     except Exception as e:  # noqa: BLE001
         print("vllm-win moe_decode patch warning:", repr(e))
         return
+    _load_hip_moe()
     validate = os.environ.get("VLLM_WIN_MOE_VALIDATE", "0") == "1"
     _orig = CompressedTensorsWNA16MoEMethod.apply
 
