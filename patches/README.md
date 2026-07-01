@@ -63,3 +63,20 @@ blocks were read back as uninitialised int4 (garbled decode). It is included in 
 Status: correct end-to-end on gemma-4-26B (compressed-tensors W4A16 MoE); ~40 tok/s decode with
 cudagraph (global-only) / real 4.4x KV-capacity win with `KVARN_QUANT_SLIDING=1` but slower pending a
 builder D2H-sync refactor. Sliding-window semantics enforced by the decode kernel (`impl.sliding_window`).
+
+## native-attn-sliding-window.patch
+`csrc/attention/{attention_kernels.cuh, paged_attention_v1.cu}` + `csrc/ops.h`: threads a new
+`sliding_window` int param through the generic wave32 paged_attention_v1 (device kernel -> global
+kernel -> LAUNCH macro -> launcher -> public op -> ops.h decl). The QK stage gains an in-kernel
+sliding-window mask `sw_mask = (sliding_window>0) && ((seq_len-1-token_idx) >= sliding_window)` ->
+masked logit set to -FLT_MAX (excluded from the softmax normalizer AND the V accumulation), matching
+vLLM's Triton `where((context_len-seq_offset) < SLIDING_WINDOW, S, -inf)`. `sliding_window<=0`
+disables it (original full-attention behavior; perf unchanged). v2 is left intact (passes 0). This is
+built (NOT compiled into the gitignored vllm tree at runtime) via `experiments/vllm_c_ext/build_attn_c.py`
+into `vllm_win_attn_C.pyd` and loaded opt-in by the plugin (`VLLM_WIN_ATTN_NATIVE=1`).
+
+Result: the native decode kernel is ~3.2x faster than Triton `kernel_paged_attention_2d` in isolation
+and numerically correct, BUT the end-to-end ROCM_ATTN integration REGRESSES (-9% gemma, -5% ERNIE) --
+the path overhead negates the kernel win. See `docs/s5-attention-lever-and-aiter-rdna3.md`. Kept
+because the kernel is the RDNA3-native `fmha_v3` equivalent and the remaining flash-layout-swap path
+would reuse it.

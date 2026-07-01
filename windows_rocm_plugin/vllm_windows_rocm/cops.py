@@ -243,6 +243,131 @@ _OPS = [
 ]
 
 
+def _install_cache_C() -> None:
+    """Load native `_C_cache_ops` (built from csrc/cache_kernels.cu via build_cache_c.py) so the
+    sliding-layer KV write goes through the HIP reshape_and_cache_flash instead of the Triton fallback."""
+    # Default OFF pending a CLEAN A/B: native reshape_and_cache_flash is built + correct, but the only
+    # measurements so far (native ON 39.9 vs OFF 41.5) were on a DEGRADED GPU (decode had dropped from
+    # the real 56.8 baseline with VRAM free -- clock/thermal from process churn, not spill), so the ~2
+    # tok/s gap is inconclusive. Re-measure after a GPU/driver reset before flipping this on.
+    if os.environ.get("VLLM_WIN_CACHE_NATIVE", "0") != "1":
+        return
+    cache_dir = os.environ.get("VLLM_WIN_CACHE_DIR", r"C:\vw_cache_build")
+    for p in sorted(glob.glob(os.path.join(cache_dir, "vllm_win_cache_C*.pyd"))):
+        try:
+            torch.ops.load_library(p)
+            if (hasattr(torch.ops, "_C_cache_ops")
+                    and hasattr(torch.ops._C_cache_ops, "reshape_and_cache_flash")):
+                print("vllm-win: loaded native _C_cache_ops (reshape_and_cache_flash) from", p)
+                return
+        except Exception as e:  # noqa: BLE001
+            print("vllm-win native _C_cache_ops load warning:", repr(e))
+
+
+_S5_NATIVE_CALLS = [0]
+
+
+def _patch_rocm_decode() -> None:
+    """Monkeypatch chunked_prefill_paged_decode so the pure-DECODE path for head_size==256 (gemma's
+    fp16 sliding layers) calls our native torch.ops._C.paged_attention_v1 (S5, ~3.2x vs the Triton
+    kernel_paged_attention_2d it replaces) instead of the Triton decode kernel. Reads the SAME v0 paged
+    KV cache (written by ROCM_ATTN's reshape_and_cache v0), and native's sliding mask
+    ((seq_len-1-token) >= sw) matches kpa2d's (context_len-seq_offset) < SLIDING_WINDOW exactly. Prefill
+    (max_query_len>1), non-256 heads, fp8/alibi/sinks/block-table-ptr all fall through to the original."""
+    try:
+        import vllm.v1.attention.ops.chunked_prefill_paged_decode as _mod
+    except Exception as e:  # noqa: BLE001  (never break plugin init over the patch)
+        print("vllm-win S5 patch skipped (import failed):", repr(e))
+        return
+    _orig = _mod.chunked_prefill_paged_decode
+
+    def _wrapper(query, key, value, output, kv_cache_dtype, key_cache, value_cache, block_table,
+                 query_start_loc, seq_lens, max_seq_len, max_query_len, k_scale, v_scale,
+                 alibi_slopes=None, sliding_window=None, sm_scale=None, output_scale=None,
+                 sinks=None, is_block_table_ptr=False):
+        head_size = query.shape[2]
+        # native paged_attention_v1 instantiates head sizes up to 256 (incl. 128, 256). gemma sliding
+        # layers are 256; ERNIE-4.5 (and most llama/qwen) are 128 -- both fire the native decode swap.
+        if (max_query_len == 1 and head_size in (128, 256) and kv_cache_dtype == "auto"
+                and alibi_slopes is None and sinks is None and not is_block_table_ptr
+                and output_scale is None and key_cache.dim() == 5):
+            scale = sm_scale if sm_scale is not None else 1.0 / (head_size ** 0.5)
+            sw = 0 if (sliding_window is None or sliding_window <= 0) else int(sliding_window)
+            num_kv_heads = key_cache.shape[1]
+            block_size = value_cache.shape[3]
+            bt = block_table if block_table.dtype == torch.int32 else block_table.to(torch.int32)
+            torch.ops._C.paged_attention_v1(
+                output, query, key_cache, value_cache, num_kv_heads, scale,
+                bt, seq_lens, block_size, max_seq_len, alibi_slopes, kv_cache_dtype,
+                k_scale, v_scale, 0, 0, 0, 0, 0, sw)
+            _S5_NATIVE_CALLS[0] += 1
+            return
+        return _orig(query, key, value, output, kv_cache_dtype, key_cache, value_cache, block_table,
+                     query_start_loc, seq_lens, max_seq_len, max_query_len, k_scale, v_scale,
+                     alibi_slopes, sliding_window, sm_scale, output_scale, sinks, is_block_table_ptr)
+
+    _mod.chunked_prefill_paged_decode = _wrapper
+    # Disable the ROCm "custom paged attention" gate: on gfx1x it PASSES for head_size==128 (ERNIE,
+    # llama, qwen) and makes chunked_prefill_paged_decode call ops.paged_attention_rocm ==
+    # torch.ops._rocm_C.paged_attention -- the gfx9 wave64 MFMA kernel we do NOT have (our _rocm_C has
+    # only wvSplitK/LLMM1). That decode-part runs even during PREFILL (filtered per-seq), so it crashes
+    # before our wrapper's pure-decode native swap ever matters. Forcing it False routes the non-native
+    # decode-part to the Triton kernel_paged_attention_2d (reads the same v0 cache), which exists; our
+    # wrapper still swaps the pure-decode (max_query_len==1) to native paged_attention_v1.
+    try:
+        import vllm.platforms.rocm as _rp
+        _rp.use_rocm_custom_paged_attention = lambda *a, **k: False
+    except Exception as e:  # noqa: BLE001
+        print("vllm-win S5 use_rocm_custom disable warning:", repr(e))
+    # Do NOT import vllm.v1.attention.backends.rocm_attn here: install() can run at plugin/sitecustomize
+    # time (before vllm is fully up), and importing the backends module then triggers a circular import
+    # that aborts plugin registration (and with it the WNA16 fallback). rocm_attn.py does
+    # `from ...chunked_prefill_paged_decode import chunked_prefill_paged_decode` at ITS import time, which
+    # is later than this patch (backend is built during engine init) -> it binds the patched _wrapper.
+    import sys as _sys
+    _ra = _sys.modules.get("vllm.v1.attention.backends.rocm_attn")
+    if _ra is not None and hasattr(_ra, "chunked_prefill_paged_decode"):
+        _ra.chunked_prefill_paged_decode = _wrapper  # already-imported: rebind in place (no import)
+    print("vllm-win: S5 native paged_attention_v1 patched into ROCM_ATTN decode (head_size 128/256)"
+          " + use_rocm_custom_paged_attention disabled")
+
+
+def _install_attn_C() -> None:
+    """Load native paged_attention_v1/v2 (built from csrc/attention via build_attn_c.py, registered as
+    TORCH_LIBRARY_FRAGMENT(_C) so it coexists with vllm_win_C) and patch the ROCM_ATTN decode path (S5).
+    Opt-in: needs VLLM_WIN_ATTN_NATIVE=1 AND ROCM_ATTN backend + kv_cache_dtype=auto for the sliding layers."""
+    if os.environ.get("VLLM_WIN_ATTN_NATIVE", "0") != "1":
+        return
+    attn_dir = os.environ.get("VLLM_WIN_ATTN_DIR", r"C:\vw_attn_build")
+    for p in sorted(glob.glob(os.path.join(attn_dir, "vllm_win_attn_C*.pyd"))):
+        try:
+            torch.ops.load_library(p)
+            if hasattr(torch.ops._C, "paged_attention_v1"):
+                print("vllm-win: loaded native _C.paged_attention_v1 from", p)
+                # NOTE: do NOT monkeypatch here. install() runs during plugin register() while vllm is
+                # mid-import; importing chunked_prefill_paged_decode now triggers a circular import that
+                # aborts plugin registration (killing the WNA16 fallback). If the ops module is already
+                # loaded (rare at install time) patch now; otherwise the harness/caller must invoke
+                # maybe_patch_s5_decode() AFTER `from vllm import LLM` (see below).
+                if "vllm.v1.attention.ops.chunked_prefill_paged_decode" in sys.modules:
+                    _patch_rocm_decode()
+                return
+        except Exception as e:  # noqa: BLE001
+            print("vllm-win native _C attn load warning:", repr(e))
+
+
+def maybe_patch_s5_decode() -> None:
+    """Apply the S5 decode monkeypatch. Call this AFTER `from vllm import LLM` and BEFORE LLM(...) so the
+    ROCM_ATTN backend (imported during engine init) binds the patched chunked_prefill_paged_decode. Safe:
+    no-op unless VLLM_WIN_ATTN_NATIVE=1 and the native op is loaded."""
+    if os.environ.get("VLLM_WIN_ATTN_NATIVE", "0") != "1":
+        return
+    if not (hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "paged_attention_v1")):
+        print("vllm-win: S5 patch skipped (native paged_attention_v1 not loaded)")
+        return
+    _patch_rocm_decode()
+
+
 def install() -> None:
     global _INSTALLED
     if _INSTALLED:
@@ -285,6 +410,8 @@ def install() -> None:
     # keep a ref so the Library isn't GC'd
     globals()["_LIB"] = lib
     _install_moe_C()  # fused-MoE ops (_moe_C namespace) torch fallbacks
+    _install_cache_C()  # native reshape_and_cache_flash (_C_cache_ops), else Triton fallback
+    _install_attn_C()  # S5: native paged_attention_v1 decode swap on ROCM_ATTN (head 256), opt-in
     _INSTALLED = True
     if native:
         present = [s.split("(", 1)[0] for s, _ in _OPS
