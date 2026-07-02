@@ -23,6 +23,17 @@ from vllm.triton_utils import tl, triton
 _BIAS = 8.0
 
 
+@triton.autotune(
+    # gate_up (wide N) wins big with small BLOCK_N (more N-tiles -> all 84 CUs busy hiding DRAM latency);
+    # down (narrow N) keeps BLOCK_N=64. key=[K,N] tunes the two shapes separately. Runs at eager warmup
+    # before cudagraph capture (same as awq_gemv). Measured: gate_up ~2.0-2.3x (180->385 GB/s), bit-identical.
+    # VLLM_WIN_MOE_NOAUTOTUNE=1 pins the old hardcoded BLOCK_N=64 (for clean A/B of the autotune's e2e effect).
+    configs=([triton.Config({"BLOCK_N": 64}, num_warps=4)]
+             if os.environ.get("VLLM_WIN_MOE_NOAUTOTUNE") == "1"
+             else [triton.Config({"BLOCK_N": bn}, num_warps=nw)
+                   for bn in (8, 16, 32, 64) for nw in (1, 2, 4)]),
+    key=["K", "N"],
+)
 @triton.jit
 def _moe_gemv_batched_kernel(x_ptr, w_ptr, s_ptr, ids_ptr, o_ptr, K, N, Kp, Gc, SXE, NE,
                              BLOCK_N: tl.constexpr, GROUP: tl.constexpr, BIAS: tl.constexpr):
@@ -67,7 +78,7 @@ def _moe_gemv_batched(x, w, s, ids, group_size, x_per_expert):
     o = torch.empty(E, N, dtype=x.dtype, device=x.device)
     grid = lambda m: (E, triton.cdiv(N, m["BLOCK_N"]))
     _moe_gemv_batched_kernel[grid](x, w, s, ids, o, K, N, Kp, s.shape[2], sxe, NE,
-                                   BLOCK_N=64, GROUP=group_size, BIAS=_BIAS)
+                                   GROUP=group_size, BIAS=_BIAS)  # BLOCK_N/num_warps via @triton.autotune
     return o
 
 
