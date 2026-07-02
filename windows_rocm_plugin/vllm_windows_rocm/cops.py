@@ -368,6 +368,71 @@ def maybe_patch_s5_decode() -> None:
     _patch_rocm_decode()
 
 
+_FLASH_CALLS = [0]
+_FLASH_ARGN = ["q", "k", "v", "out", "cu_seqlens_q", "max_seqlen_q", "seqused_k", "max_seqlen_k",
+               "softmax_scale", "causal", "window_size", "block_table", "softcap",
+               "q_descale", "k_descale", "v_descale"]
+
+
+def maybe_patch_flash_decode() -> None:
+    """FLASH-KERNEL path (the real one): keep TRITON_ATTN's light fused path (rope+KV-write, metadata)
+    and swap ONLY unified_attention for a native decode kernel that reads TRITON_ATTN's FLASH KV cache
+    directly (no v0 repack, no ROCM_ATTN overhead that made the S5 ROCM_ATTN path regress). Pure decode
+    only (max_seqlen_q==1); prefill/chunked fall through to the real unified_attention. Opt-in:
+    VLLM_WIN_FLASH_ATTN=1. Call AFTER `from vllm import LLM`, BEFORE LLM(...)."""
+    if os.environ.get("VLLM_WIN_FLASH_ATTN", "0") != "1":
+        return
+    d = os.environ.get("VLLM_WIN_FLASH_DIR", r"C:\vw_attnflash_build")
+    loaded = hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "paged_attention_flash")
+    if not loaded:
+        for p in sorted(glob.glob(os.path.join(d, "vllm_win_attn_flash_C*.pyd"))):
+            try:
+                torch.ops.load_library(p)
+                if hasattr(torch.ops._C, "paged_attention_flash"):
+                    loaded = True
+                    print("vllm-win: loaded native _C.paged_attention_flash from", p)
+                    break
+            except Exception as e:  # noqa: BLE001
+                print("vllm-win flash load warning:", repr(e))
+    if not loaded:
+        print("vllm-win: flash patch skipped (paged_attention_flash not loaded)")
+        return
+    try:
+        import vllm.v1.attention.ops.triton_unified_attention as _mod
+    except Exception as e:  # noqa: BLE001
+        print("vllm-win flash patch skipped (import failed):", repr(e))
+        return
+    _orig = _mod.unified_attention
+
+    def _wrap(*args, **kw):
+        a = dict(zip(_FLASH_ARGN, args))
+        a.update(kw)
+        q, k, v, out = a["q"], a["k"], a["v"], a["out"]
+        head = q.shape[2]
+        # pure-decode fast path only; everything else -> real unified_attention
+        if (a.get("max_seqlen_q") == 1 and k.dim() == 4 and head in (128, 256)
+                and q.dtype in (torch.float16, torch.bfloat16)
+                and k.dtype in (torch.float16, torch.bfloat16)
+                and k.shape[1] == 16 and not a.get("softcap")
+                and a.get("sinks") is None and a.get("alibi_slopes") is None):
+            ws = a.get("window_size")
+            sw = int(ws[0]) + 1 if (ws is not None and ws[0] is not None and ws[0] >= 0) else 0
+            bt = a["block_table"]
+            bt = bt if bt.dtype == torch.int32 else bt.to(torch.int32)
+            torch.ops._C.paged_attention_flash(
+                out, q, k, v, k.shape[2], float(a["softmax_scale"]), bt,
+                a["seqused_k"], 16, int(a["max_seqlen_k"]), sw)
+            _FLASH_CALLS[0] += 1
+            return
+        return _orig(*args, **kw)
+
+    _mod.unified_attention = _wrap
+    _ta = sys.modules.get("vllm.v1.attention.backends.triton_attn")
+    if _ta is not None and hasattr(_ta, "unified_attention"):
+        _ta.unified_attention = _wrap
+    print("vllm-win: flash decode patched into unified_attention (head 128/256, pure decode)")
+
+
 def install() -> None:
     global _INSTALLED
     if _INSTALLED:

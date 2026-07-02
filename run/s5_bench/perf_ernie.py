@@ -21,6 +21,9 @@ ROUTE = os.environ.get("S5_ROUTE", "0") == "1"
 if ROUTE:
     os.environ["VLLM_WIN_ATTN_NATIVE"] = "1"
     os.environ["VLLM_WIN_CACHE_NATIVE"] = "1"
+FLASH = os.environ.get("FLASH", "0") == "1"
+if FLASH:
+    os.environ["VLLM_WIN_FLASH_ATTN"] = "1"  # swap unified_attention -> native flash kernel (pure decode)
 
 import torch
 from vllm import LLM, SamplingParams
@@ -37,10 +40,16 @@ if ROUTE:
         _C5.maybe_patch_s5_decode()
     except Exception as e:
         print("S5 cops patch failed:", repr(e))
+if FLASH:
+    try:
+        import vllm_windows_rocm.cops as _C5
+        _C5.maybe_patch_flash_decode()
+    except Exception as e:
+        print("flash patch failed:", repr(e))
 
 free0, total = torch.cuda.mem_get_info()
 BACKEND = "ROCM_ATTN" if ROUTE else "TRITON_ATTN"
-print(f"== ERNIE | S5_ROUTE={ROUTE} OPT={OPT} backend={BACKEND} cg={CG} | free {free0/GIB:.1f}/{total/GIB:.1f} GiB maxlen={MAXLEN} util={GPUUTIL}")
+print(f"== ERNIE | S5_ROUTE={ROUTE} FLASH={FLASH} OPT={OPT} backend={BACKEND} cg={CG} | free {free0/GIB:.1f}/{total/GIB:.1f} GiB maxlen={MAXLEN} util={GPUUTIL}")
 extra = (dict(enforce_eager=False, compilation_config={"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"})
          if CG else dict(enforce_eager=True))
 t0 = time.perf_counter()
@@ -61,13 +70,15 @@ for _ in range(3):
     torch.cuda.synchronize()
     best = max(best, len(out[0].outputs[0].token_ids) / (time.perf_counter() - t0))
 free2, _ = torch.cuda.mem_get_info()
-print(f"S5_ROUTE={ROUTE} OPT={OPT}  decode tok/s (best of 3): {best:.1f}  | FREE VRAM now {free2/GIB:.2f} GiB")
-if ROUTE:
-    try:
-        import vllm_windows_rocm.cops as _C5
+print(f"S5_ROUTE={ROUTE} FLASH={FLASH} OPT={OPT}  decode tok/s (best of 3): {best:.1f}  | FREE VRAM now {free2/GIB:.2f} GiB")
+try:
+    import vllm_windows_rocm.cops as _C5
+    if ROUTE:
         print(f"S5 native paged_attention_v1 calls: {_C5._S5_NATIVE_CALLS[0]}")
-    except Exception:
-        pass
+    if FLASH:
+        print(f"FLASH paged_attention_flash calls: {_C5._FLASH_CALLS[0]}")
+except Exception:
+    pass
 co = llm.generate(["Question: What is the capital of France? Give a one-line answer."],
                   SamplingParams(temperature=0.0, max_tokens=64))
 print("COHERENCE:", repr(co[0].outputs[0].text[:220]))

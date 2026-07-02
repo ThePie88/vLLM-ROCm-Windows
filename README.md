@@ -32,8 +32,11 @@ each model. All weights are 4-bit; KV cache fp16 unless noted.
 | `sahilchachra/Qwythos-9B-Claude-Mythos-5-1M-AWQ` (Qwen3.5 hybrid, 9B) | compressed-tensors W4A16 | 11.4 → 22.3 → **39.9** | eager → +inductor/hipGraph → +native exllama GEMM (8k ctx) |
 | `Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4` (dense, 7B) | GPTQ Int4 | **78** | native exllama GEMM + inductor/hipGraph (8k ctx) |
 | `casperhansen/deepseek-r1-distill-qwen-14b-awq` (dense, 14B) | AWQ Int4 | 12.2 → **50.9** | stock `conch` fallback → custom M=1 W4 GEMV, autotuned (4k ctx) |
+| `cyankiwi/ERNIE-4.5-21B-A3B-Thinking-AWQ-4bit` (**MoE**, 21B / A3B active, head 128) | compressed-tensors W4A16 gs32 | 62.7 → **79.2** | stock → +M=1 MoE-decode gather-GEMV + native `wvSplitK` dense (4k ctx). Fits 20GB VRAM with ~3 GiB free — spill-free, so these numbers are trustworthy |
 
-The Qwythos-9B hybrid (24 linear-attention + 8 full-attention layers, plus an unquantized
+ERNIE-4.5-21B is a compressed-tensors W4A16 MoE (64 experts, top-2) that fits entirely in VRAM
+(unlike the 26B-class MoEs whose ~17GB of weights overfill a 20GB card and silently spill to
+shared DRAM, contaminating the tok/s). The Qwythos-9B hybrid (24 linear-attention + 8 full-attention layers, plus an unquantized
 vision tower and a 248k vocab) is a worst case; the dense GPTQ/AWQ models are closer to what the
 hardware allows. Aggregate throughput scales with concurrency (Qwen2.5-7B, greedy): ~73 tok/s
 at batch 4, ~232 at batch 16, ~358 at batch 32.

@@ -92,3 +92,27 @@ ROCM_ATTN backend). The AITER-on-RDNA3 program therefore continues as: build the
 attention as a flash-layout drop-in for `unified_attention`, then (later) a wave32 WMMA GEMM for the
 prefill/batch path. Everything stays opt-in and default-off; nothing here changes the working
 TRITON_ATTN path.
+
+## Flash-kernel result (2026-07-02): done, and it does NOT win e2e -- the native-attention advantage is head-256-specific
+
+We built the flash-layout kernel described above: `experiments/vllm_c_ext/paged_attention_flash.cu` ->
+`torch.ops._C.paged_attention_flash`, a fresh decode-only kernel that reads TRITON_ATTN's flash KV layout
+`[num_blocks, block_size, num_kv_heads, head_size]` DIRECTLY (thread-group Phase-1 QK + unrolled/vectorized
+loads, in-kernel sliding mask). `cops.maybe_patch_flash_decode()` (`VLLM_WIN_FLASH_ATTN=1`) monkeypatches
+`unified_attention` so a pure-decode call (`max_seqlen_q==1`, head 128/256) runs it, keeping TRITON_ATTN's
+light fused path -- NO ROCM_ATTN overhead. It is correct (rel ~3e-4 fp16, sliding OK) and fires (1960x on
+an ERNIE run) with coherent output.
+
+**But e2e on ERNIE-4.5-21B (head 128, clean VRAM): 58.8 tok/s vs 79.2 baseline = -26%.** The kernel is
+~82us (head 128, seq 512) in isolation; the Triton `unified_attention` is ~40us at head 128 -- i.e. Triton
+is already well-tuned there and our hand kernel is ~2x slower. The earlier "native is 3.2x faster than
+unified" (that motivated this whole line) was measured at head 256 (gemma), where `unified_attention` is
+pathologically slow (284us). **So the native-decode-attention advantage is HEAD-256-SPECIFIC, not general.**
+At the common head-128 (ERNIE / llama / qwen) the Triton unified is good; even a v0-perfect flash kernel
+(~40us) would only TIE it (no e2e win). At head 256 the flash kernel would win ~1.7x -- but the only head-256
+MoE we have (gemma-4-26B) overfills VRAM and spills, so it cannot be measured cleanly.
+
+Net: the flash path is architecturally correct and the kernel is banked (reusable for a head-256 model on
+adequate VRAM/hardware), but it yields no clean decode win on the models we can measure. The AITER-on-RDNA3
+program's decode-attention piece is therefore parked: `unified_attention` is not the beatable target at
+head 128 that it is at head 256.
