@@ -29,17 +29,24 @@ each model. All weights are 4-bit; KV cache fp16 unless noted.
 
 | Model | Quantization | decode (tok/s) | notes |
 | --- | --- | --- | --- |
-| `sahilchachra/Qwythos-9B-Claude-Mythos-5-1M-AWQ` (Qwen3.5 hybrid, 9B) | compressed-tensors W4A16 | 11.4 → 22.3 → **39.9** | eager → +inductor/hipGraph → +native exllama GEMM (8k ctx) |
-| `Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4` (dense, 7B) | GPTQ Int4 | **78** | native exllama GEMM + inductor/hipGraph (8k ctx) |
-| `casperhansen/deepseek-r1-distill-qwen-14b-awq` (dense, 14B) | AWQ Int4 | 12.2 → **50.9** | stock `conch` fallback → custom M=1 W4 GEMV, autotuned (4k ctx) |
-| `cyankiwi/ERNIE-4.5-21B-A3B-Thinking-AWQ-4bit` (**MoE**, 21B / A3B active, head 128) | compressed-tensors W4A16 gs32 | 62.7 → **79.2** | stock → +M=1 MoE-decode gather-GEMV + native `wvSplitK` dense (4k ctx). Fits 20GB VRAM with ~3 GiB free — spill-free, so these numbers are trustworthy |
+| `Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4` (dense, 7B) | GPTQ Int4 | **115** | native exllama GEMM + hipGraph decode, `gpu_memory_utilization=0.9` (spill-verified clean) |
+| `cyankiwi/ERNIE-4.5-21B-A3B-Thinking-AWQ-4bit` (**MoE**, 21B / A3B active, head 128) | compressed-tensors W4A16 gs32 | 62.7 → **79.2** | stock → +M=1 MoE-decode gather-GEMV + native `wvSplitK` dense. Fits 20GB with ~3 GiB free — spill-free |
+| `sahilchachra/Qwythos-9B-Claude-Mythos-5-1M-AWQ` (Qwen3.5 hybrid, 9B) | compressed-tensors W4A16 | **61.7** | native exllama + hipGraph, **`gpu_memory_utilization=0.7`** (see note) |
+| `casperhansen/deepseek-r1-distill-qwen-14b-awq` (dense, 14B) | AWQ Int4 | **50.3** | custom M=1 W4 GEMV, autotuned, util 0.9 (spill-verified clean) |
 
-ERNIE-4.5-21B is a compressed-tensors W4A16 MoE (64 experts, top-2) that fits entirely in VRAM
-(unlike the 26B-class MoEs whose ~17GB of weights overfill a 20GB card and silently spill to
-shared DRAM, contaminating the tok/s). The Qwythos-9B hybrid (24 linear-attention + 8 full-attention layers, plus an unquantized
-vision tower and a 248k vocab) is a worst case; the dense GPTQ/AWQ models are closer to what the
-hardware allows. Aggregate throughput scales with concurrency (Qwen2.5-7B, greedy): ~73 tok/s
-at batch 4, ~232 at batch 16, ~358 at batch 32.
+Numbers re-measured 2026-07-02, cudagraph (`FULL_DECODE_ONLY`) decode, and **verified spill-free** by
+polling the Windows GPU shared-memory counter during the run (peak shared == the ~0.76 GiB desktop
+baseline). `torch.cuda.mem_get_info()` only reports *dedicated* VRAM free, so it does NOT catch a WDDM
+spill on its own.
+
+**VRAM caveat (per-model `gpu_memory_utilization`).** Standard dense models (Qwen, deepseek) are safe at
+0.9. The **Qwythos-9B hybrid** (linear-attention Mamba state cache + an **unquantized vision tower** + a
+248k vocab) is NOT: vLLM's memory profiling does not account for the Mamba/vision allocations, so at 0.9 it
+fills dedicated VRAM with KV and those extras overflow ~2.7 GiB into shared DRAM — a fake, spill-slowed
+number (that was the old 39.9). At `util=0.7` it runs entirely in dedicated VRAM (6 GiB free) and is both
+clean and faster (61.7). The 26B-class MoEs (gemma-4, 17GB weights) overfill 20GB at any workable util, so
+ERNIE-4.5-21B is used as the clean MoE bench. Aggregate throughput scales with concurrency (Qwen2.5-7B,
+greedy): ~73 tok/s at batch 4, ~232 at batch 16, ~358 at batch 32.
 
 Decode is still below the card's ~800 GB/s memory-bandwidth roofline; per-shape GEMV tuning,
 fp8-KV scale calibration, and porting the rest of the `csrc` kernels are ongoing.
