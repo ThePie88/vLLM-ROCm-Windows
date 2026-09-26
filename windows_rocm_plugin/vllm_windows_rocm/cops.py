@@ -20,10 +20,13 @@ weak_ref_tensor). Set VLLM_WIN_C_DIR to override the build dir; set VLLM_WIN_C_N
 force pure fallbacks (for A/B measurement).
 """
 import glob
+import logging
 import os
 import sys
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 _INSTALLED = False
 _NATIVE_DIR = os.environ.get("VLLM_WIN_C_DIR", r"C:\vw_cext_build")
@@ -602,4 +605,8 @@ def install() -> None:
     if native:
         present = [s.split("(", 1)[0] for s, _ in _OPS
                    if hasattr(torch.ops._C, s.split("(", 1)[0])]
-        print("vllm-win: native _C kernels loaded from", native, "| ops:", present)
+        # logger, not print: this runs at import time in EVERY interpreter (also via
+        # sitecustomize), including vLLM/py-cpuinfo subprocesses that write machine-readable
+        # JSON to stdout. A bare print there corrupts their output (py-cpuinfo crashed with
+        # JSONDecodeError on this exact mechanism).
+        logger.info("native _C kernels loaded from %s | ops: %s", native, present)
