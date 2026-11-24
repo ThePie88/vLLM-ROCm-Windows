@@ -17,6 +17,8 @@ import winrocm_paths as wp
 import torch
 from torch.utils import cpp_extension
 
+import win_crt_fix  # noqa: E402,F401  (patches cpp_extension for torch 2.10)
+
 from torch.utils.hipify import hipify_python as _hp
 _orig = _hp.hipify
 def _no_none(*a, **k):
