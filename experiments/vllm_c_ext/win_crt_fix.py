@@ -1,17 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 chenjiahong
 """Shared cpp_extension patches for torch 2.10 + ROCm on native Windows.
 
 Imported for side effects by the sibling build_*.py scripts (one import line each). Two things in
 ``torch.utils.cpp_extension`` do not fit a HIP build on Windows:
 
-  * ``_prepare_ldflags`` takes the ``IS_WINDOWS`` branch. It does pick ``c10_hip`` / ``torch_hip``
-    via ``IS_HIP_EXTENSION``, but it also appends ``-INCLUDE:?warp_size@cuda@at@@YAHXZ`` -- a CUDA
-    translation-unit symbol that does not exist in torch_hip, so the link fails -- and it never
-    adds ``amdhip64.lib``, which a HIP extension needs. Replace the function with the HIP variant
-    below. (torch 2.10 also inserted a ``with_sycl`` parameter, so the replacement accepts a
-    variable arity and reads only the tail of the argument list.)
+  * ``_prepare_ldflags`` takes the ``IS_WINDOWS`` branch. It picks ``c10_hip`` / ``torch_hip`` via
+    ``IS_HIP_EXTENSION``, appends ``-INCLUDE:?warp_size@cuda@at@@YAHXZ`` (written for torch_cuda)
+    and does not add ``amdhip64.lib``. It is replaced by the HIP variant below, which drops the
+    ``-INCLUDE`` and adds ``amdhip64.lib``. PR #34 reported a link failure with torch's version on
+    a setup using the TheRock pip SDK; on torch 2.10.0+rocm7.13.0a20260508 ``torch_hip.lib`` does
+    export that symbol and the build scripts already pass ``amdhip64.lib``, so with that torch
+    the replacement links the same libraries. (torch 2.10 also inserted a ``with_sycl``
+    parameter, so the replacement accepts a variable arity and reads only the tail of the
+    argument list.)
   * torch 2.10 emits the MSVC flag ``/std:c++17`` for C++ sources, which clang rejects as a
-    filename: ``clang: error: no such file or directory: '/std:c++17'``. Rewrite it to
-    ``-std=c++17`` in the generated ninja file.
+    filename: ``clang: error: no such file or directory: '/std:c++17'``. It is rewritten to
+    ``-std=c++17`` in the generated ninja file. MSVC ``cl`` does not accept ``-std=c++17``, so a
+    build that compiles ``.cpp`` sources with ``cl`` must not use this rewrite; the build scripts
+    importing this module compile ``.cu`` sources only, through hipcc.
 
 Note on ``-fms-runtime-lib``: torch 2.10 sets ``-fms-runtime-lib=dll`` for HIP
 (``COMMON_HIP_FLAGS``), i.e. the dynamic CRT. Forcing the static CRT
